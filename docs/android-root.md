@@ -24,8 +24,18 @@ The root mirrors modern Android partition boundaries:
   for app compatibility checks, not a claim that Vodka implements Android 15.
 - Android framework, ART, Bionic, PackageManager, Binder services, graphics,
   audio, input, sensors, and permission enforcement are not implemented yet.
+- Installed APKs are staged under `/data/app/<package>-1/base.apk`, with app
+  data under `/data/data/<package>/`.
+- `install-runtime` can copy Android `system/`, `vendor/`, `product/`, `odm`,
+  and `apex` artifacts into a prefix root for the `app_process` backend.
 
 ## Host Helpers
+
+Create a full Vodka prefix containing an Android root:
+
+```sh
+build/vodka init
+```
 
 Bootstrap or refresh the skeleton:
 

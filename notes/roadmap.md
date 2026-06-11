@@ -9,6 +9,10 @@
 
 ## Phase 1: Minimal Userspace Probe
 
+- Create the default prefix at `$HOME/.vodka`.
+- Stage APKs into the prefix and track installed package metadata.
+- Launch installed apps through an external `exec` runtime backend.
+- Import Android runtime artifacts and launch `app_process` with ART environment.
 - Start a host process with Android-like environment variables.
 - Resolve `/system`, `/data`, `/vendor`, and `/product` paths through the Vodka
   root.
