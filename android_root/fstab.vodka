@@ -1,0 +1,8 @@
+# Android fs_mgr-style mount table for Vodka's initial root.
+#
+# <src>     <mount_point>  <type>  <mount_flags>           <fs_mgr_flags>
+proc        /proc          proc    nosuid,nodev,noexec     wait
+sysfs       /sys           sysfs   nosuid,nodev,noexec     wait
+tmpfs       /dev           tmpfs   mode=0755,nosuid        wait
+tmpfs       /mnt           tmpfs   mode=0755,nosuid,nodev  wait
+tmpfs       /tmp           tmpfs   mode=1777,nosuid,nodev  wait

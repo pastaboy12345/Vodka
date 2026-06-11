@@ -1,0 +1,24 @@
+# Generic system properties for Vodka's initial Android root.
+
+ro.product.brand=Vodka
+ro.product.manufacturer=Vodka
+ro.product.model=Vodka Linux Runtime
+ro.product.name=vodka_x86_64
+ro.product.device=vodka
+ro.build.product=vodka
+
+ro.build.type=userdebug
+ro.build.tags=test-keys
+ro.build.version.sdk=35
+ro.build.version.release=15
+ro.build.version.codename=REL
+ro.build.version.incremental=0
+
+ro.product.cpu.abilist=x86_64,x86
+ro.product.cpu.abilist64=x86_64
+ro.product.cpu.abilist32=x86
+ro.dalvik.vm.isa.x86_64=x86_64
+ro.dalvik.vm.isa.x86=x86
+
+persist.sys.locale=en-US
+ro.config.low_ram=false

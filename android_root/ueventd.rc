@@ -1,0 +1,14 @@
+# Device node permissions expected by early Android userspace.
+#
+# Host integration will decide which nodes are passed through, emulated, or
+# backed by Vodka services.
+
+/dev/null       0666 root root
+/dev/zero       0666 root root
+/dev/full       0666 root root
+/dev/random     0666 root root
+/dev/urandom    0666 root root
+/dev/ashmem     0666 root root
+/dev/binder     0666 root root
+/dev/hwbinder   0666 root root
+/dev/vndbinder  0666 root root

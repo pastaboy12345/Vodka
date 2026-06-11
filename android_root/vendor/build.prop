@@ -1,0 +1,3 @@
+# Vendor partition properties for the initial Vodka root.
+
+ro.vendor.vodka.root=1

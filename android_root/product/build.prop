@@ -1,0 +1,6 @@
+# Product partition properties for the initial Vodka root.
+
+ro.product.product.brand=Vodka
+ro.product.product.name=vodka
+ro.product.product.device=vodka
+ro.product.product.model=Vodka Linux Runtime

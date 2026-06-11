@@ -1,0 +1,33 @@
+# Minimal Android init stub for the Vodka runtime.
+#
+# This file documents the first filesystem contract. It is not expected to boot
+# a complete Android userspace until the runtime service model is implemented.
+
+import /system/etc/init/*.rc
+import /vendor/etc/init/*.rc
+import /product/etc/init/*.rc
+import /odm/etc/init/*.rc
+
+on early-init
+    mkdir /dev 0755 root root
+    mkdir /proc 0555 root root
+    mkdir /sys 0555 root root
+    mkdir /mnt 0755 root root
+
+on init
+    export ANDROID_ROOT /system
+    export ANDROID_DATA /data
+    export ANDROID_STORAGE /storage
+    export EXTERNAL_STORAGE /sdcard
+
+    mkdir /cache 0770 system cache
+    mkdir /data 0771 system system
+    mkdir /data/app 0771 system system
+    mkdir /data/data 0771 system system
+    mkdir /data/local 0751 shell shell
+    mkdir /data/local/tmp 0771 shell shell
+    mkdir /data/misc 01771 system misc
+    mkdir /data/system 0775 system system
+    mkdir /storage 0755 root root
+    mkdir /storage/emulated 0555 root root
+    mkdir /tmp 0771 shell shell
