@@ -1,0 +1,61 @@
+# Build output
+build/
+builds/
+dist/
+out/
+target/
+.cache/
+
+# Logs
+*.log
+logs/
+
+# Secrets
+.env
+.env.*
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# Rust
+target/
+
+# C/C++
+*.o
+*.out
+*.so
+*.a
+*.exe
+
+# VM/disk junk
+*.qcow2
+*.vdi
+*.vmdk
+*.img
+*.iso
+
+# Editor junk
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
