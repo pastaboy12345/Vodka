@@ -30,6 +30,7 @@ Import runtime artifacts first:
 
 ```sh
 build/vodka install-runtime --from /path/to/android-root --binder /dev/binder
+build/vodka binder-status
 ```
 
 Then run an installed package:
@@ -55,6 +56,23 @@ build/vodka run \
   --binder /dev/binder \
   com.example.app
 ```
+
+`binder-status --binder DEVICE --configure` updates `runtime.binder.device` and
+writes the Binder service expectation file consumed by status and run planning.
+
+Service bridges can be configured independently:
+
+```sh
+build/vodka bridge-status --service package --exec build/vodka-package-bridge
+build/vodka start-services --service package --wait
+```
+
+The app_process backend does not start service bridges automatically; start them
+before launching apps when the backend depends on bridged services.
+The built `build/vodka-<service>-bridge` executables validate the bridge
+environment and write per-service runtime state. They are the host bridge
+process boundary for the next Binder service work, not a complete Android
+system-service implementation.
 
 ## Exec Contract
 

@@ -26,6 +26,10 @@ The root mirrors modern Android partition boundaries:
   audio, input, sensors, and permission enforcement are not implemented yet.
 - Installed APKs are staged under `/data/app/<package>-1/base.apk`, with app
   data under `/data/data/<package>/`.
+- Installed package state is generated under `/data/system/packages.xml`,
+  `/data/system/packages.list`, and `/data/system/users/0/package-restrictions.xml`.
+- Binder compatibility state is generated under
+  `/data/system/vodka-binder-services.conf`.
 - `install-runtime` can copy Android `system/`, `vendor/`, `product/`, `odm`,
   and `apex` artifacts into a prefix root for the `app_process` backend.
 

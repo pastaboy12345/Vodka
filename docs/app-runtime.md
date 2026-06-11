@@ -8,6 +8,9 @@ backend for an installed package.
 ```sh
 build/vodka init
 build/vodka install-runtime --from /path/to/android-root --binder /dev/binder
+build/vodka binder-status
+build/vodka bridge-status --service package --exec build/vodka-package-bridge
+build/vodka start-services --dry-run
 build/vodka install app.apk
 build/vodka list
 build/vodka run --dry-run com.example.app
@@ -18,10 +21,16 @@ build/vodka run --backend exec --exec /path/to/backend com.example.app
 `install` performs the first Android-style staging work:
 
 - validates that the APK is a ZIP file with `AndroidManifest.xml`,
-- derives the package name from a stored plain-text manifest when possible,
+- reads stored or deflated manifest entries,
+- derives the package name from plain-text or Android binary XML manifests,
 - accepts `--package NAME` when the manifest cannot be parsed yet,
 - copies the APK to `android_root/data/app/<package>-1/base.apk`,
 - creates `android_root/data/data/<package>/`,
+- assigns a stable Android app UID,
+- records manifest `uses-permission` declarations when available,
+- records `minSdkVersion`, `targetSdkVersion`, and the first launcher activity
+  it can identify,
+- refreshes PackageManager-style state under `android_root/data/system/`,
 - writes prefix metadata to `apps/<package>/metadata.conf`.
 
 `run --dry-run` validates the root, installed APK, app data directory, and
@@ -100,6 +109,15 @@ runtime.binder.device=/dev/binder
 
 `vodka status` reports `binder_ready` and whether the configured app process is
 executable.
+
+`vodka binder-status --configure` can update only the Binder device and Binder
+compatibility files without reinstalling runtime artifacts.
+
+`vodka bridge-status` and `vodka start-services` manage external service bridge
+processes for package/activity/window/display/input-style Binder services.
+The checked-in bridge source builds `build/vodka-<service>-bridge` executables
+that validate the service environment, open the configured Binder device, and
+write `android_root/data/system/vodka-service-<service>.state`.
 
 ## Built-In Runtime Work
 

@@ -13,6 +13,10 @@
 - Stage APKs into the prefix and track installed package metadata.
 - Launch installed apps through an external `exec` runtime backend.
 - Import Android runtime artifacts and launch `app_process` with ART environment.
+- Generate PackageManager-style installed package state under `/data/system`.
+- Track Binder device readiness and required service compatibility state.
+- Configure and launch external Binder service bridge processes.
+- Build concrete host bridge executables for tracked Binder-facing services.
 - Start a host process with Android-like environment variables.
 - Resolve `/system`, `/data`, `/vendor`, and `/product` paths through the Vodka
   root.

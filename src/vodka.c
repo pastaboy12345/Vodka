@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #define VODKA_PATH_MAX 4096
 #define VODKA_KEY_MAX 128
@@ -19,10 +20,26 @@
 #define VODKA_SOURCE_MAX 128
 #define VODKA_MAX_PROPERTIES 256
 #define VODKA_PACKAGE_MAX 256
+#define VODKA_ACTIVITY_MAX 512
+#define VODKA_PERMISSION_MAX 256
+#define VODKA_MAX_PERMISSIONS 128
 #define VODKA_MAX_APPS 512
 #define VODKA_ZIP_TAIL_MAX 65557
 #define VODKA_MANIFEST_MAX 1048576
+#define VODKA_APP_UID_BASE 10000
+#define VODKA_DEFAULT_TARGET_SDK 35
 #define VODKA_PREFIX_VERSION "0"
+#define VODKA_ZIP_METHOD_STORE 0
+#define VODKA_ZIP_METHOD_DEFLATE 8
+#define VODKA_AXML_NO_INDEX 0xffffffffu
+#define VODKA_AXML_RES_STRING_POOL_TYPE 0x0001
+#define VODKA_AXML_RES_XML_TYPE 0x0003
+#define VODKA_AXML_START_ELEMENT_TYPE 0x0102
+#define VODKA_AXML_END_ELEMENT_TYPE 0x0103
+#define VODKA_AXML_STRING_POOL_UTF8_FLAG 0x00000100u
+#define VODKA_AXML_TYPE_STRING 0x03
+#define VODKA_AXML_TYPE_INT_DEC 0x10
+#define VODKA_AXML_TYPE_INT_HEX 0x11
 
 struct vodka_property {
     char key[VODKA_KEY_MAX];
@@ -45,6 +62,12 @@ struct static_file {
     const char *content;
 };
 
+struct service_bridge {
+    const char *name;
+    const char *binder_name;
+    bool required;
+};
+
 struct apk_info {
     bool valid_zip;
     bool has_manifest;
@@ -52,6 +75,34 @@ struct apk_info {
     uint32_t manifest_compressed_size;
     uint32_t manifest_uncompressed_size;
     uint32_t manifest_local_offset;
+};
+
+struct manifest_permissions {
+    char items[VODKA_MAX_PERMISSIONS][VODKA_PERMISSION_MAX];
+    size_t count;
+};
+
+struct manifest_details {
+    char package[VODKA_PACKAGE_MAX];
+    char launch_activity[VODKA_ACTIVITY_MAX];
+    struct manifest_permissions permissions;
+    int min_sdk;
+    int target_sdk;
+    bool has_package;
+    bool has_launch_activity;
+    bool has_min_sdk;
+    bool has_target_sdk;
+    bool parsed;
+    char format[16];
+};
+
+struct axml_string_pool {
+    const unsigned char *chunk;
+    size_t chunk_size;
+    uint32_t string_count;
+    uint32_t style_count;
+    uint32_t strings_start;
+    bool utf8;
 };
 
 struct run_options {
@@ -88,6 +139,21 @@ static const char *const prefix_dirs[] = {
     "logs",
     "tmp",
 };
+
+static const struct service_bridge service_bridges[] = {
+    {"activity", "activity", true},
+    {"package", "package", true},
+    {"window", "window", true},
+    {"display", "display", true},
+    {"input", "input", true},
+    {"power", "power", true},
+    {"surfaceflinger", "SurfaceFlinger", true},
+    {"sensorservice", "sensorservice", false},
+    {"audio", "audio", false},
+    {"clipboard", "clipboard", false},
+};
+
+static bool set_runtime_env(const char *key, const char *value);
 
 static const char *const android_root_dirs[] = {
     "acct",
@@ -664,6 +730,54 @@ static bool validate_package_name(const char *package)
     return saw_dot && !need_segment_start;
 }
 
+static bool validate_permission_name(const char *permission)
+{
+    if (permission == NULL || *permission == '\0' || strlen(permission) >= VODKA_PERMISSION_MAX) {
+        return false;
+    }
+
+    bool saw_dot = false;
+    bool last_was_dot = true;
+    for (const unsigned char *cursor = (const unsigned char *)permission; *cursor != '\0'; cursor++) {
+        if (*cursor == '.') {
+            if (last_was_dot) {
+                return false;
+            }
+            saw_dot = true;
+            last_was_dot = true;
+            continue;
+        }
+        if (!isalnum(*cursor) && *cursor != '_') {
+            return false;
+        }
+        last_was_dot = false;
+    }
+
+    return saw_dot && !last_was_dot;
+}
+
+static bool add_manifest_permission(struct manifest_permissions *permissions, const char *name)
+{
+    if (!validate_permission_name(name)) {
+        return true;
+    }
+
+    for (size_t i = 0; i < permissions->count; i++) {
+        if (strcmp(permissions->items[i], name) == 0) {
+            return true;
+        }
+    }
+
+    if (permissions->count >= VODKA_MAX_PERMISSIONS) {
+        fprintf(stderr, "too many requested permissions in manifest; increase VODKA_MAX_PERMISSIONS\n");
+        return false;
+    }
+
+    copy_string(permissions->items[permissions->count], VODKA_PERMISSION_MAX, name);
+    permissions->count++;
+    return true;
+}
+
 static bool prefix_apps_dir(char *dest, size_t dest_size, const char *prefix)
 {
     return join_path(dest, dest_size, prefix, "apps");
@@ -871,34 +985,28 @@ static bool inspect_apk(const char *path, struct apk_info *info)
     return ok;
 }
 
-static char *find_substring(char *haystack, const char *needle)
-{
-    const size_t needle_len = strlen(needle);
-
-    if (needle_len == 0) {
-        return haystack;
-    }
-
-    for (char *cursor = haystack; *cursor != '\0'; cursor++) {
-        if (strncmp(cursor, needle, needle_len) == 0) {
-            return cursor;
-        }
-    }
-
-    return NULL;
-}
-
-static bool extract_plain_manifest_package(
+static bool read_manifest_entry(
     const char *apk_path,
     const struct apk_info *info,
-    char *dest,
-    size_t dest_size)
+    unsigned char **data_out,
+    size_t *size_out)
 {
-    if (!info->has_manifest || info->manifest_method != 0) {
+    *data_out = NULL;
+    *size_out = 0;
+
+    if (!info->has_manifest) {
         return false;
     }
     if (info->manifest_uncompressed_size == 0 ||
         info->manifest_uncompressed_size > VODKA_MANIFEST_MAX) {
+        return false;
+    }
+    if (info->manifest_method != VODKA_ZIP_METHOD_STORE &&
+        info->manifest_method != VODKA_ZIP_METHOD_DEFLATE) {
+        return false;
+    }
+    if (info->manifest_compressed_size == 0 ||
+        info->manifest_compressed_size > VODKA_MANIFEST_MAX * 2u) {
         return false;
     }
 
@@ -908,6 +1016,7 @@ static bool extract_plain_manifest_package(
         return false;
     }
 
+    bool ok = true;
     if (fseek(file, (long)info->manifest_local_offset, SEEK_SET) != 0) {
         fclose(file);
         return false;
@@ -927,23 +1036,760 @@ static bool extract_plain_manifest_package(
         return false;
     }
 
-    char *manifest = malloc((size_t)info->manifest_uncompressed_size + 1);
-    if (manifest == NULL) {
+    unsigned char *compressed = malloc((size_t)info->manifest_compressed_size);
+    unsigned char *manifest = malloc((size_t)info->manifest_uncompressed_size + 1);
+    if (compressed == NULL || manifest == NULL) {
         fprintf(stderr, "out of memory while reading manifest\n");
+        free(compressed);
+        free(manifest);
         fclose(file);
         return false;
     }
 
-    const size_t read_count = fread(manifest, 1, info->manifest_uncompressed_size, file);
+    if (fread(compressed, 1, info->manifest_compressed_size, file) != info->manifest_compressed_size) {
+        ok = false;
+    }
     fclose(file);
-    if (read_count != info->manifest_uncompressed_size) {
+
+    if (ok && info->manifest_method == VODKA_ZIP_METHOD_STORE) {
+        if (info->manifest_compressed_size != info->manifest_uncompressed_size) {
+            ok = false;
+        } else {
+            memcpy(manifest, compressed, info->manifest_uncompressed_size);
+        }
+    } else if (ok && info->manifest_method == VODKA_ZIP_METHOD_DEFLATE) {
+        z_stream stream;
+        memset(&stream, 0, sizeof(stream));
+
+        stream.next_in = compressed;
+        stream.avail_in = info->manifest_compressed_size;
+        stream.next_out = manifest;
+        stream.avail_out = info->manifest_uncompressed_size;
+
+        if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
+            ok = false;
+        } else {
+            const int zstatus = inflate(&stream, Z_FINISH);
+            if (zstatus != Z_STREAM_END ||
+                stream.total_out != info->manifest_uncompressed_size) {
+                ok = false;
+            }
+            if (inflateEnd(&stream) != Z_OK) {
+                ok = false;
+            }
+        }
+    }
+
+    free(compressed);
+
+    if (!ok) {
         free(manifest);
         return false;
     }
+
     manifest[info->manifest_uncompressed_size] = '\0';
+    *data_out = manifest;
+    *size_out = info->manifest_uncompressed_size;
+    return true;
+}
+
+static char *find_substring(char *haystack, const char *needle)
+{
+    const size_t needle_len = strlen(needle);
+
+    if (needle_len == 0) {
+        return haystack;
+    }
+
+    for (char *cursor = haystack; *cursor != '\0'; cursor++) {
+        if (strncmp(cursor, needle, needle_len) == 0) {
+            return cursor;
+        }
+    }
+
+    return NULL;
+}
+
+static bool contains_substring_before(const char *start, const char *limit, const char *needle)
+{
+    const size_t needle_len = strlen(needle);
+
+    if (needle_len == 0) {
+        return true;
+    }
+
+    for (const char *cursor = start; cursor < limit && *cursor != '\0'; cursor++) {
+        if ((size_t)(limit - cursor) < needle_len) {
+            return false;
+        }
+        if (strncmp(cursor, needle, needle_len) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool read_plain_manifest(
+    const char *apk_path,
+    const struct apk_info *info,
+    char **manifest_out)
+{
+    *manifest_out = NULL;
+
+    unsigned char *manifest = NULL;
+    size_t manifest_size = 0;
+    if (!read_manifest_entry(apk_path, info, &manifest, &manifest_size)) {
+        return false;
+    }
+
+    size_t start = 0;
+    while (start < manifest_size && isspace(manifest[start])) {
+        start++;
+    }
+    if (start >= manifest_size || manifest[start] != '<') {
+        free(manifest);
+        return false;
+    }
+
+    *manifest_out = (char *)manifest;
+    return true;
+}
+
+static bool extract_quoted_attribute(
+    const char *start,
+    const char *limit,
+    const char *attribute,
+    char *dest,
+    size_t dest_size)
+{
+    const size_t attribute_len = strlen(attribute);
+
+    for (const char *cursor = start; cursor < limit && *cursor != '\0'; cursor++) {
+        if ((size_t)(limit - cursor) < attribute_len ||
+            strncmp(cursor, attribute, attribute_len) != 0) {
+            continue;
+        }
+        if (cursor > start) {
+            const unsigned char before = (unsigned char)cursor[-1];
+            if (isalnum(before) || before == '_' || before == ':' || before == '-') {
+                continue;
+            }
+        }
+
+        cursor += attribute_len;
+        while (cursor < limit && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (cursor >= limit || *cursor != '=') {
+            continue;
+        }
+        cursor++;
+        while (cursor < limit && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (cursor >= limit || (*cursor != '"' && *cursor != '\'')) {
+            continue;
+        }
+
+        const char quote = *cursor++;
+        const char *end = cursor;
+        while (end < limit && *end != quote) {
+            end++;
+        }
+        if (end >= limit) {
+            return false;
+        }
+
+        const size_t len = (size_t)(end - cursor);
+        if (len >= dest_size) {
+            return false;
+        }
+        memcpy(dest, cursor, len);
+        dest[len] = '\0';
+        return true;
+    }
+
+    return false;
+}
+
+static bool parse_nonnegative_int(const char *value, int *dest)
+{
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(value, &end, 0);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 2147483647L) {
+        return false;
+    }
+
+    *dest = (int)parsed;
+    return true;
+}
+
+static void set_manifest_package(struct manifest_details *details, const char *package)
+{
+    if (!validate_package_name(package)) {
+        return;
+    }
+
+    copy_string(details->package, sizeof(details->package), package);
+    details->has_package = true;
+}
+
+static bool normalize_activity_name(
+    char *dest,
+    size_t dest_size,
+    const char *package,
+    const char *activity)
+{
+    if (activity == NULL || activity[0] == '\0') {
+        return false;
+    }
+
+    if (activity[0] == '.') {
+        if (package == NULL || package[0] == '\0') {
+            return false;
+        }
+
+        const int written = snprintf(dest, dest_size, "%s%s", package, activity);
+        return written >= 0 && (size_t)written < dest_size;
+    }
+
+    if (strchr(activity, '.') == NULL) {
+        if (package == NULL || package[0] == '\0') {
+            return false;
+        }
+
+        const int written = snprintf(dest, dest_size, "%s.%s", package, activity);
+        return written >= 0 && (size_t)written < dest_size;
+    }
+
+    if (strlen(activity) >= dest_size) {
+        return false;
+    }
+
+    copy_string(dest, dest_size, activity);
+    return true;
+}
+
+static void set_manifest_launch_activity(struct manifest_details *details, const char *activity)
+{
+    if (details->has_launch_activity || !details->has_package) {
+        return;
+    }
+
+    char normalized[VODKA_ACTIVITY_MAX];
+    if (!normalize_activity_name(normalized, sizeof(normalized), details->package, activity)) {
+        return;
+    }
+
+    copy_string(details->launch_activity, sizeof(details->launch_activity), normalized);
+    details->has_launch_activity = true;
+}
+
+static bool read_axml_utf8_length(
+    const unsigned char *data,
+    size_t size,
+    size_t *cursor,
+    size_t *length)
+{
+    if (*cursor >= size) {
+        return false;
+    }
+
+    unsigned char first = data[(*cursor)++];
+    if ((first & 0x80u) == 0) {
+        *length = first;
+        return true;
+    }
+
+    if (*cursor >= size) {
+        return false;
+    }
+
+    *length = ((size_t)(first & 0x7fu) << 8) | data[(*cursor)++];
+    return true;
+}
+
+static bool read_axml_utf16_length(
+    const unsigned char *data,
+    size_t size,
+    size_t *cursor,
+    size_t *length)
+{
+    if (*cursor + 2 > size) {
+        return false;
+    }
+
+    uint16_t first = read_le16(data + *cursor);
+    *cursor += 2;
+    if ((first & 0x8000u) == 0) {
+        *length = first;
+        return true;
+    }
+
+    if (*cursor + 2 > size) {
+        return false;
+    }
+
+    const uint16_t second = read_le16(data + *cursor);
+    *cursor += 2;
+    *length = ((size_t)(first & 0x7fffu) << 16) | second;
+    return true;
+}
+
+static bool append_utf8_codepoint(char *dest, size_t dest_size, size_t *used, uint32_t codepoint)
+{
+    unsigned char encoded[4];
+    size_t encoded_len = 0;
+
+    if (codepoint <= 0x7fu) {
+        encoded[encoded_len++] = (unsigned char)codepoint;
+    } else if (codepoint <= 0x7ffu) {
+        encoded[encoded_len++] = (unsigned char)(0xc0u | (codepoint >> 6));
+        encoded[encoded_len++] = (unsigned char)(0x80u | (codepoint & 0x3fu));
+    } else if (codepoint <= 0xffffu) {
+        encoded[encoded_len++] = (unsigned char)(0xe0u | (codepoint >> 12));
+        encoded[encoded_len++] = (unsigned char)(0x80u | ((codepoint >> 6) & 0x3fu));
+        encoded[encoded_len++] = (unsigned char)(0x80u | (codepoint & 0x3fu));
+    } else if (codepoint <= 0x10ffffu) {
+        encoded[encoded_len++] = (unsigned char)(0xf0u | (codepoint >> 18));
+        encoded[encoded_len++] = (unsigned char)(0x80u | ((codepoint >> 12) & 0x3fu));
+        encoded[encoded_len++] = (unsigned char)(0x80u | ((codepoint >> 6) & 0x3fu));
+        encoded[encoded_len++] = (unsigned char)(0x80u | (codepoint & 0x3fu));
+    } else {
+        return false;
+    }
+
+    if (*used + encoded_len >= dest_size) {
+        return false;
+    }
+
+    memcpy(dest + *used, encoded, encoded_len);
+    *used += encoded_len;
+    dest[*used] = '\0';
+    return true;
+}
+
+static bool axml_string_pool_init(
+    struct axml_string_pool *pool,
+    const unsigned char *chunk,
+    size_t chunk_size)
+{
+    if (chunk_size < 28 || read_le16(chunk) != VODKA_AXML_RES_STRING_POOL_TYPE) {
+        return false;
+    }
+
+    const uint16_t header_size = read_le16(chunk + 2);
+    if (header_size < 28 || header_size > chunk_size) {
+        return false;
+    }
+
+    const uint32_t string_count = read_le32(chunk + 8);
+    const uint32_t style_count = read_le32(chunk + 12);
+    const uint32_t flags = read_le32(chunk + 16);
+    const uint32_t strings_start = read_le32(chunk + 20);
+    const size_t offsets_end = (size_t)header_size + ((size_t)string_count * 4u) + ((size_t)style_count * 4u);
+
+    if (strings_start < offsets_end || strings_start >= chunk_size) {
+        return false;
+    }
+
+    pool->chunk = chunk;
+    pool->chunk_size = chunk_size;
+    pool->string_count = string_count;
+    pool->style_count = style_count;
+    pool->strings_start = strings_start;
+    pool->utf8 = (flags & VODKA_AXML_STRING_POOL_UTF8_FLAG) != 0;
+    return true;
+}
+
+static bool axml_string_pool_get(
+    const struct axml_string_pool *pool,
+    uint32_t index,
+    char *dest,
+    size_t dest_size)
+{
+    if (dest_size == 0) {
+        return false;
+    }
+    dest[0] = '\0';
+
+    if (pool->chunk == NULL || index == VODKA_AXML_NO_INDEX || index >= pool->string_count) {
+        return false;
+    }
+
+    const uint16_t header_size = read_le16(pool->chunk + 2);
+    const size_t offset_position = (size_t)header_size + ((size_t)index * 4u);
+    if (offset_position + 4 > pool->chunk_size) {
+        return false;
+    }
+
+    const uint32_t string_offset = read_le32(pool->chunk + offset_position);
+    const size_t string_start = (size_t)pool->strings_start + string_offset;
+    if (string_start >= pool->chunk_size) {
+        return false;
+    }
+
+    size_t cursor = string_start;
+    if (pool->utf8) {
+        size_t utf16_len = 0;
+        size_t byte_len = 0;
+        (void)utf16_len;
+        if (!read_axml_utf8_length(pool->chunk, pool->chunk_size, &cursor, &utf16_len) ||
+            !read_axml_utf8_length(pool->chunk, pool->chunk_size, &cursor, &byte_len) ||
+            cursor + byte_len > pool->chunk_size ||
+            byte_len >= dest_size) {
+            return false;
+        }
+
+        memcpy(dest, pool->chunk + cursor, byte_len);
+        dest[byte_len] = '\0';
+        return true;
+    }
+
+    size_t char_count = 0;
+    if (!read_axml_utf16_length(pool->chunk, pool->chunk_size, &cursor, &char_count) ||
+        char_count > (pool->chunk_size - cursor) / 2u) {
+        return false;
+    }
+
+    size_t used = 0;
+    for (size_t i = 0; i < char_count; i++) {
+        uint32_t codepoint = read_le16(pool->chunk + cursor + (i * 2u));
+
+        if (codepoint >= 0xd800u && codepoint <= 0xdbffu && i + 1 < char_count) {
+            const uint32_t low = read_le16(pool->chunk + cursor + ((i + 1u) * 2u));
+            if (low >= 0xdc00u && low <= 0xdfffu) {
+                codepoint = 0x10000u + (((codepoint - 0xd800u) << 10) | (low - 0xdc00u));
+                i++;
+            }
+        }
+
+        if (!append_utf8_codepoint(dest, dest_size, &used, codepoint)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool axml_attribute_string_value(
+    const struct axml_string_pool *pool,
+    const unsigned char *attribute,
+    char *dest,
+    size_t dest_size)
+{
+    const uint32_t raw_value = read_le32(attribute + 8);
+    const uint8_t value_type = attribute[15];
+    const uint32_t value_data = read_le32(attribute + 16);
+
+    if (raw_value != VODKA_AXML_NO_INDEX) {
+        return axml_string_pool_get(pool, raw_value, dest, dest_size);
+    }
+
+    if (value_type == VODKA_AXML_TYPE_STRING) {
+        return axml_string_pool_get(pool, value_data, dest, dest_size);
+    }
+
+    if (value_type == VODKA_AXML_TYPE_INT_DEC || value_type == VODKA_AXML_TYPE_INT_HEX) {
+        const int written = snprintf(dest, dest_size, "%u", value_data);
+        return written >= 0 && (size_t)written < dest_size;
+    }
+
+    return false;
+}
+
+static bool axml_attribute_int_value(
+    const struct axml_string_pool *pool,
+    const unsigned char *attribute,
+    int *dest)
+{
+    const uint8_t value_type = attribute[15];
+    const uint32_t value_data = read_le32(attribute + 16);
+
+    if (value_type == VODKA_AXML_TYPE_INT_DEC || value_type == VODKA_AXML_TYPE_INT_HEX) {
+        if (value_data > 2147483647u) {
+            return false;
+        }
+        *dest = (int)value_data;
+        return true;
+    }
+
+    char value[64];
+    if (!axml_attribute_string_value(pool, attribute, value, sizeof(value))) {
+        return false;
+    }
+
+    return parse_nonnegative_int(value, dest);
+}
+
+static bool parse_binary_manifest_start_element(
+    struct manifest_details *details,
+    const struct axml_string_pool *pool,
+    const unsigned char *chunk,
+    size_t chunk_size,
+    size_t depth,
+    size_t *component_depth,
+    size_t *filter_depth,
+    bool *filter_has_main_action,
+    bool *filter_has_launcher_category,
+    char *component_activity,
+    size_t component_activity_size)
+{
+    if (chunk_size < 36) {
+        return false;
+    }
+
+    const uint32_t tag_index = read_le32(chunk + 20);
+    const uint16_t attribute_start = read_le16(chunk + 24);
+    const uint16_t attribute_size = read_le16(chunk + 26);
+    const uint16_t attribute_count = read_le16(chunk + 28);
+    const size_t attribute_base = 16u + attribute_start;
+    char tag[128];
+
+    if (attribute_size < 20 ||
+        attribute_base > chunk_size ||
+        attribute_base + ((size_t)attribute_count * attribute_size) > chunk_size ||
+        !axml_string_pool_get(pool, tag_index, tag, sizeof(tag))) {
+        return false;
+    }
+
+    if (strcmp(tag, "intent-filter") == 0 && *component_depth != 0) {
+        *filter_depth = depth;
+        *filter_has_main_action = false;
+        *filter_has_launcher_category = false;
+    }
+
+    bool is_component = strcmp(tag, "activity") == 0 || strcmp(tag, "activity-alias") == 0;
+    if (is_component) {
+        *component_depth = depth;
+        *filter_depth = 0;
+        component_activity[0] = '\0';
+    }
+
+    for (uint16_t i = 0; i < attribute_count; i++) {
+        const unsigned char *attribute = chunk + attribute_base + ((size_t)i * attribute_size);
+        const uint32_t name_index = read_le32(attribute + 4);
+        char attr_name[128];
+
+        if (!axml_string_pool_get(pool, name_index, attr_name, sizeof(attr_name))) {
+            continue;
+        }
+
+        if (strcmp(tag, "manifest") == 0 && strcmp(attr_name, "package") == 0) {
+            char value[VODKA_PACKAGE_MAX];
+            if (axml_attribute_string_value(pool, attribute, value, sizeof(value))) {
+                set_manifest_package(details, value);
+            }
+            continue;
+        }
+
+        if (strcmp(tag, "uses-permission") == 0 && strcmp(attr_name, "name") == 0) {
+            char value[VODKA_PERMISSION_MAX];
+            if (axml_attribute_string_value(pool, attribute, value, sizeof(value)) &&
+                !add_manifest_permission(&details->permissions, value)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (strcmp(tag, "uses-sdk") == 0 && strcmp(attr_name, "minSdkVersion") == 0) {
+            int value = 0;
+            if (axml_attribute_int_value(pool, attribute, &value)) {
+                details->min_sdk = value;
+                details->has_min_sdk = true;
+            }
+            continue;
+        }
+
+        if (strcmp(tag, "uses-sdk") == 0 && strcmp(attr_name, "targetSdkVersion") == 0) {
+            int value = 0;
+            if (axml_attribute_int_value(pool, attribute, &value)) {
+                details->target_sdk = value;
+                details->has_target_sdk = true;
+            }
+            continue;
+        }
+
+        if (is_component && strcmp(attr_name, "name") == 0) {
+            char value[VODKA_ACTIVITY_MAX];
+            if (axml_attribute_string_value(pool, attribute, value, sizeof(value)) &&
+                normalize_activity_name(component_activity, component_activity_size, details->package, value)) {
+                continue;
+            }
+        }
+
+        if (*filter_depth != 0 &&
+            strcmp(tag, "action") == 0 &&
+            strcmp(attr_name, "name") == 0) {
+            char value[VODKA_VALUE_MAX];
+            if (axml_attribute_string_value(pool, attribute, value, sizeof(value)) &&
+                strcmp(value, "android.intent.action.MAIN") == 0) {
+                *filter_has_main_action = true;
+            }
+            continue;
+        }
+
+        if (*filter_depth != 0 &&
+            strcmp(tag, "category") == 0 &&
+            strcmp(attr_name, "name") == 0) {
+            char value[VODKA_VALUE_MAX];
+            if (axml_attribute_string_value(pool, attribute, value, sizeof(value)) &&
+                strcmp(value, "android.intent.category.LAUNCHER") == 0) {
+                *filter_has_launcher_category = true;
+            }
+            continue;
+        }
+    }
+
+    return true;
+}
+
+static bool parse_binary_manifest_details(
+    const char *apk_path,
+    const struct apk_info *info,
+    struct manifest_details *details)
+{
+    unsigned char *manifest = NULL;
+    size_t manifest_size = 0;
+    if (!read_manifest_entry(apk_path, info, &manifest, &manifest_size)) {
+        return false;
+    }
+
+    if (manifest_size < 8 ||
+        read_le16(manifest) != VODKA_AXML_RES_XML_TYPE ||
+        read_le16(manifest + 2) < 8 ||
+        read_le32(manifest + 4) > manifest_size) {
+        free(manifest);
+        return false;
+    }
+
+    const size_t xml_size = read_le32(manifest + 4);
+    struct axml_string_pool pool = {0};
+    bool found_string_pool = false;
+
+    size_t offset = read_le16(manifest + 2);
+    while (offset + 8 <= xml_size) {
+        const unsigned char *chunk = manifest + offset;
+        const uint16_t type = read_le16(chunk);
+        const uint16_t header_size = read_le16(chunk + 2);
+        const uint32_t chunk_size = read_le32(chunk + 4);
+
+        if (header_size < 8 || chunk_size < header_size || offset + chunk_size > xml_size) {
+            free(manifest);
+            return false;
+        }
+
+        if (type == VODKA_AXML_RES_STRING_POOL_TYPE) {
+            found_string_pool = axml_string_pool_init(&pool, chunk, chunk_size);
+            break;
+        }
+
+        offset += chunk_size;
+    }
+
+    if (!found_string_pool) {
+        free(manifest);
+        return false;
+    }
+
+    details->parsed = true;
+    copy_string(details->format, sizeof(details->format), "binary");
+    details->target_sdk = VODKA_DEFAULT_TARGET_SDK;
+
+    size_t depth = 0;
+    size_t component_depth = 0;
+    size_t filter_depth = 0;
+    bool filter_has_main_action = false;
+    bool filter_has_launcher_category = false;
+    char component_activity[VODKA_ACTIVITY_MAX];
+    component_activity[0] = '\0';
+
+    offset = read_le16(manifest + 2);
+    while (offset + 8 <= xml_size) {
+        const unsigned char *chunk = manifest + offset;
+        const uint16_t type = read_le16(chunk);
+        const uint16_t header_size = read_le16(chunk + 2);
+        const uint32_t chunk_size = read_le32(chunk + 4);
+
+        if (header_size < 8 || chunk_size < header_size || offset + chunk_size > xml_size) {
+            free(manifest);
+            return false;
+        }
+
+        if (type == VODKA_AXML_START_ELEMENT_TYPE) {
+            depth++;
+            if (!parse_binary_manifest_start_element(
+                    details,
+                    &pool,
+                    chunk,
+                    chunk_size,
+                    depth,
+                    &component_depth,
+                    &filter_depth,
+                    &filter_has_main_action,
+                    &filter_has_launcher_category,
+                    component_activity,
+                    sizeof(component_activity))) {
+                free(manifest);
+                return false;
+            }
+        } else if (type == VODKA_AXML_END_ELEMENT_TYPE) {
+            char tag[128];
+            if (chunk_size >= 24 &&
+                axml_string_pool_get(&pool, read_le32(chunk + 20), tag, sizeof(tag))) {
+                if (filter_depth == depth && strcmp(tag, "intent-filter") == 0) {
+                    if (!details->has_launch_activity &&
+                        filter_has_main_action &&
+                        filter_has_launcher_category &&
+                        component_activity[0] != '\0') {
+                        copy_string(details->launch_activity, sizeof(details->launch_activity), component_activity);
+                        details->has_launch_activity = true;
+                    }
+                    filter_depth = 0;
+                    filter_has_main_action = false;
+                    filter_has_launcher_category = false;
+                }
+
+                if (component_depth == depth &&
+                    (strcmp(tag, "activity") == 0 || strcmp(tag, "activity-alias") == 0)) {
+                    component_depth = 0;
+                    component_activity[0] = '\0';
+                }
+            }
+
+            if (depth > 0) {
+                depth--;
+            }
+        }
+
+        offset += chunk_size;
+    }
+
+    free(manifest);
+    return true;
+}
+
+static bool extract_plain_manifest_details(
+    const char *apk_path,
+    const struct apk_info *info,
+    struct manifest_details *details)
+{
+    char *manifest = NULL;
+    if (!read_plain_manifest(apk_path, info, &manifest)) {
+        return false;
+    }
+
+    details->parsed = true;
+    copy_string(details->format, sizeof(details->format), "text");
+    details->target_sdk = VODKA_DEFAULT_TARGET_SDK;
 
     char *package_key = find_substring(manifest, "package");
-    bool ok = false;
     while (package_key != NULL) {
         char *cursor = package_key + strlen("package");
         while (isspace((unsigned char)*cursor)) {
@@ -958,11 +1804,12 @@ static bool extract_plain_manifest_package(
                 const char quote = *cursor++;
                 char *end = strchr(cursor, quote);
                 if (end != NULL) {
+                    char value[VODKA_PACKAGE_MAX];
                     const size_t len = (size_t)(end - cursor);
-                    if (len < dest_size) {
-                        memcpy(dest, cursor, len);
-                        dest[len] = '\0';
-                        ok = validate_package_name(dest);
+                    if (len < sizeof(value)) {
+                        memcpy(value, cursor, len);
+                        value[len] = '\0';
+                        set_manifest_package(details, value);
                     }
                 }
                 break;
@@ -972,8 +1819,120 @@ static bool extract_plain_manifest_package(
         package_key = find_substring(package_key + 1, "package");
     }
 
+    bool ok = true;
+    char *tag = find_substring(manifest, "<uses-permission");
+    while (tag != NULL) {
+        char *tag_end = strchr(tag, '>');
+        if (tag_end == NULL) {
+            break;
+        }
+
+        char permission[VODKA_PERMISSION_MAX];
+        if (extract_quoted_attribute(tag, tag_end, "android:name", permission, sizeof(permission)) ||
+            extract_quoted_attribute(tag, tag_end, "name", permission, sizeof(permission))) {
+            if (!add_manifest_permission(&details->permissions, permission)) {
+                ok = false;
+                break;
+            }
+        }
+
+        tag = find_substring(tag_end + 1, "<uses-permission");
+    }
+
+    tag = find_substring(manifest, "<uses-sdk");
+    if (tag != NULL) {
+        char *tag_end = strchr(tag, '>');
+        if (tag_end != NULL) {
+            char value[64];
+            int parsed = 0;
+
+            if ((extract_quoted_attribute(tag, tag_end, "android:minSdkVersion", value, sizeof(value)) ||
+                    extract_quoted_attribute(tag, tag_end, "minSdkVersion", value, sizeof(value))) &&
+                parse_nonnegative_int(value, &parsed)) {
+                details->min_sdk = parsed;
+                details->has_min_sdk = true;
+            }
+
+            if ((extract_quoted_attribute(tag, tag_end, "android:targetSdkVersion", value, sizeof(value)) ||
+                    extract_quoted_attribute(tag, tag_end, "targetSdkVersion", value, sizeof(value))) &&
+                parse_nonnegative_int(value, &parsed)) {
+                details->target_sdk = parsed;
+                details->has_target_sdk = true;
+            }
+        }
+    }
+
+    tag = find_substring(manifest, "<activity");
+    while (tag != NULL && details->has_package && !details->has_launch_activity) {
+        char *tag_end = strchr(tag, '>');
+        if (tag_end == NULL) {
+            break;
+        }
+
+        char activity[VODKA_ACTIVITY_MAX];
+        if (!(extract_quoted_attribute(tag, tag_end, "android:name", activity, sizeof(activity)) ||
+                extract_quoted_attribute(tag, tag_end, "name", activity, sizeof(activity)))) {
+            tag = find_substring(tag_end + 1, "<activity");
+            continue;
+        }
+
+        char *activity_end = find_substring(tag_end + 1, "</activity");
+        if (activity_end == NULL) {
+            break;
+        }
+
+        char *filter = find_substring(tag_end + 1, "<intent-filter");
+        while (filter != NULL && filter < activity_end) {
+            char *filter_end = find_substring(filter, "</intent-filter");
+            if (filter_end == NULL || filter_end > activity_end) {
+                break;
+            }
+
+            if (contains_substring_before(filter, filter_end, "android.intent.action.MAIN") &&
+                contains_substring_before(filter, filter_end, "android.intent.category.LAUNCHER")) {
+                set_manifest_launch_activity(details, activity);
+                break;
+            }
+
+            filter = find_substring(filter_end + 1, "<intent-filter");
+        }
+
+        tag = find_substring(activity_end + 1, "<activity");
+    }
+
     free(manifest);
     return ok;
+}
+
+static void init_manifest_details(struct manifest_details *details)
+{
+    memset(details, 0, sizeof(*details));
+    details->target_sdk = VODKA_DEFAULT_TARGET_SDK;
+    copy_string(details->format, sizeof(details->format), "unknown");
+}
+
+static bool extract_manifest_details(
+    const char *apk_path,
+    const struct apk_info *info,
+    struct manifest_details *details)
+{
+    struct manifest_details parsed;
+
+    init_manifest_details(details);
+
+    init_manifest_details(&parsed);
+    if (parse_binary_manifest_details(apk_path, info, &parsed)) {
+        *details = parsed;
+        return true;
+    }
+
+    init_manifest_details(&parsed);
+    if (extract_plain_manifest_details(apk_path, info, &parsed)) {
+        *details = parsed;
+        return true;
+    }
+
+    return true;
 }
 
 static bool setup_android_root(const char *root)
@@ -1461,6 +2420,214 @@ static bool binder_device_ready(const char *path)
     return S_ISCHR(stat_buffer.st_mode) || S_ISREG(stat_buffer.st_mode);
 }
 
+static const struct service_bridge *find_service_bridge(const char *name)
+{
+    for (size_t i = 0; i < sizeof(service_bridges) / sizeof(service_bridges[0]); i++) {
+        if (strcmp(service_bridges[i].name, name) == 0) {
+            return &service_bridges[i];
+        }
+    }
+
+    return NULL;
+}
+
+static bool prefix_services_config_path(char *dest, size_t dest_size, const char *prefix)
+{
+    return join_path(dest, dest_size, prefix, "config/services.conf");
+}
+
+static bool android_services_state_path(char *dest, size_t dest_size, const char *prefix)
+{
+    char android_root[VODKA_PATH_MAX];
+
+    if (!prefix_android_root(android_root, sizeof(android_root), prefix)) {
+        return false;
+    }
+
+    return join_path(dest, dest_size, android_root, "data/system/vodka-service-bridges.conf");
+}
+
+static bool load_services_config(const char *prefix, struct vodka_properties *config)
+{
+    char path[VODKA_PATH_MAX];
+
+    if (!prefix_services_config_path(path, sizeof(path), prefix)) {
+        fprintf(stderr, "path too long: %s/config/services.conf\n", prefix);
+        return false;
+    }
+
+    if (!path_exists(path)) {
+        return true;
+    }
+
+    return load_property_file(config, path, "config/services.conf");
+}
+
+static bool service_exec_key(char *dest, size_t dest_size, const char *service)
+{
+    const int written = snprintf(dest, dest_size, "service.%s.exec", service);
+    return written >= 0 && (size_t)written < dest_size;
+}
+
+static const char *service_exec_path(struct vodka_properties *config, const char *service)
+{
+    char key[VODKA_KEY_MAX];
+
+    if (!service_exec_key(key, sizeof(key), service)) {
+        return NULL;
+    }
+
+    return property_value(config, key, NULL);
+}
+
+static bool save_services_config(const char *prefix, struct vodka_properties *config)
+{
+    char path[VODKA_PATH_MAX];
+
+    if (!prefix_services_config_path(path, sizeof(path), prefix)) {
+        fprintf(stderr, "path too long: %s/config/services.conf\n", prefix);
+        return false;
+    }
+
+    return save_property_file(path, "# Vodka service bridge configuration", config);
+}
+
+static bool write_service_bridge_state(
+    const char *prefix,
+    const char *binder,
+    struct vodka_properties *services_config)
+{
+    char path[VODKA_PATH_MAX];
+
+    if (!android_services_state_path(path, sizeof(path), prefix)) {
+        fprintf(stderr, "service bridge state path is too long\n");
+        return false;
+    }
+    if (!ensure_parent_dir(path)) {
+        return false;
+    }
+
+    FILE *file = fopen(path, "w");
+    if (file == NULL) {
+        fprintf(stderr, "failed to create %s: %s\n", path, strerror(errno));
+        return false;
+    }
+
+    fprintf(
+        file,
+        "# Vodka service bridge state\n"
+        "binder.device=%s\n"
+        "binder.ready=%s\n",
+        binder == NULL ? "" : binder,
+        binder_device_ready(binder) ? "yes" : "no");
+
+    for (size_t i = 0; i < sizeof(service_bridges) / sizeof(service_bridges[0]); i++) {
+        const char *exec_path = service_exec_path(services_config, service_bridges[i].name);
+        fprintf(file, "service.%s.required=%s\n", service_bridges[i].name, service_bridges[i].required ? "yes" : "no");
+        fprintf(file, "service.%s.binder=%s\n", service_bridges[i].name, service_bridges[i].binder_name);
+        fprintf(file, "service.%s.exec=%s\n", service_bridges[i].name, exec_path == NULL ? "" : exec_path);
+        fprintf(
+            file,
+            "service.%s.ready=%s\n",
+            service_bridges[i].name,
+            exec_path != NULL && access(exec_path, X_OK) == 0 ? "yes" : "no");
+    }
+
+    if (fclose(file) != 0) {
+        fprintf(stderr, "failed to close %s: %s\n", path, strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+static const char *binder_device_kind(const char *path)
+{
+    struct stat stat_buffer;
+
+    if (path == NULL || path[0] == '\0') {
+        return "missing";
+    }
+    if (stat(path, &stat_buffer) != 0) {
+        return "missing";
+    }
+    if (S_ISCHR(stat_buffer.st_mode)) {
+        return "char";
+    }
+    if (S_ISREG(stat_buffer.st_mode)) {
+        return "regular";
+    }
+
+    return "unsupported";
+}
+
+static bool write_binder_compat_state(const char *prefix, const char *binder)
+{
+    char android_root[VODKA_PATH_MAX];
+    char binder_config[VODKA_PATH_MAX];
+    char service_state[VODKA_PATH_MAX];
+
+    if (!prefix_android_root(android_root, sizeof(android_root), prefix) ||
+        !join_path(binder_config, sizeof(binder_config), prefix, "config/binder.conf") ||
+        !join_path(service_state, sizeof(service_state), android_root, "data/system/vodka-binder-services.conf")) {
+        fprintf(stderr, "binder state path is too long\n");
+        return false;
+    }
+
+    if (!ensure_parent_dir(binder_config) || !ensure_parent_dir(service_state)) {
+        return false;
+    }
+
+    FILE *binder_file = fopen(binder_config, "w");
+    FILE *service_file = fopen(service_state, "w");
+    if (binder_file == NULL || service_file == NULL) {
+        fprintf(stderr, "failed to create Binder compatibility state: %s\n", strerror(errno));
+        if (binder_file != NULL) {
+            fclose(binder_file);
+        }
+        if (service_file != NULL) {
+            fclose(service_file);
+        }
+        return false;
+    }
+
+    FILE *files[] = {binder_file, service_file};
+    for (size_t file_index = 0; file_index < sizeof(files) / sizeof(files[0]); file_index++) {
+        FILE *file = files[file_index];
+        fprintf(
+            file,
+            "# Vodka Binder compatibility state\n"
+            "binder.device=%s\n"
+            "binder.ready=%s\n"
+            "binder.kind=%s\n",
+            binder == NULL ? "" : binder,
+            binder_device_ready(binder) ? "yes" : "no",
+            binder_device_kind(binder));
+
+        for (size_t i = 0; i < sizeof(service_bridges) / sizeof(service_bridges[0]); i++) {
+            fprintf(
+                file,
+                "service.%s=%s\n",
+                service_bridges[i].name,
+                service_bridges[i].required ? "required" : "optional");
+            fprintf(file, "service.%s.binder=%s\n", service_bridges[i].name, service_bridges[i].binder_name);
+        }
+    }
+
+    bool ok = true;
+    if (fclose(binder_file) != 0) {
+        ok = false;
+    }
+    if (fclose(service_file) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        fprintf(stderr, "failed to close Binder compatibility state files\n");
+    }
+
+    return ok;
+}
+
 static bool validate_runtime_backend_name(const char *backend)
 {
     return strcmp(backend, "none") == 0 ||
@@ -1514,6 +2681,300 @@ static size_t collect_installed_packages(
     closedir(dir);
     qsort(packages, count, VODKA_PACKAGE_MAX, compare_package_names);
     return count;
+}
+
+static int property_int_value(
+    struct vodka_properties *properties,
+    const char *key,
+    int fallback)
+{
+    const char *value = property_value(properties, key, NULL);
+    char *end = NULL;
+    long parsed = 0;
+
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 2147483647L) {
+        return fallback;
+    }
+
+    return (int)parsed;
+}
+
+static int installed_package_uid(const char *prefix, const char *package)
+{
+    char metadata_path[VODKA_PATH_MAX];
+    struct vodka_properties metadata = {0};
+
+    if (!package_metadata_path(metadata_path, sizeof(metadata_path), prefix, package)) {
+        return -1;
+    }
+    if (!path_exists(metadata_path)) {
+        return -1;
+    }
+    if (!load_property_file(&metadata, metadata_path, "metadata")) {
+        return -1;
+    }
+
+    return property_int_value(&metadata, "uid", -1);
+}
+
+static int next_available_app_uid(const char *prefix)
+{
+    char packages[VODKA_MAX_APPS][VODKA_PACKAGE_MAX];
+    const size_t count = collect_installed_packages(prefix, packages);
+    int max_uid = VODKA_APP_UID_BASE - 1;
+
+    for (size_t i = 0; i < count; i++) {
+        const int uid = installed_package_uid(prefix, packages[i]);
+        if (uid >= VODKA_APP_UID_BASE && uid > max_uid) {
+            max_uid = uid;
+        }
+    }
+
+    return max_uid + 1;
+}
+
+static bool host_to_android_path(
+    char *dest,
+    size_t dest_size,
+    const char *android_root,
+    const char *host_path)
+{
+    const size_t root_len = strlen(android_root);
+    const char *relative = host_path;
+
+    if (strncmp(host_path, android_root, root_len) == 0) {
+        relative = host_path + root_len;
+        if (*relative == '\0') {
+            relative = "/";
+        }
+    }
+
+    if (*relative != '/') {
+        const int written = snprintf(dest, dest_size, "/%s", relative);
+        return written >= 0 && (size_t)written < dest_size;
+    }
+
+    copy_string(dest, dest_size, relative);
+    return strlen(relative) < dest_size;
+}
+
+static void write_xml_escaped(FILE *file, const char *value)
+{
+    for (const char *cursor = value; cursor != NULL && *cursor != '\0'; cursor++) {
+        switch (*cursor) {
+        case '&':
+            fputs("&amp;", file);
+            break;
+        case '<':
+            fputs("&lt;", file);
+            break;
+        case '>':
+            fputs("&gt;", file);
+            break;
+        case '"':
+            fputs("&quot;", file);
+            break;
+        case '\'':
+            fputs("&apos;", file);
+            break;
+        default:
+            fputc(*cursor, file);
+            break;
+        }
+    }
+}
+
+static bool permissions_to_metadata_value(
+    char *dest,
+    size_t dest_size,
+    const struct manifest_permissions *permissions)
+{
+    size_t used = 0;
+
+    if (dest_size == 0) {
+        return false;
+    }
+    dest[0] = '\0';
+
+    for (size_t i = 0; i < permissions->count; i++) {
+        const char *separator = i == 0 ? "" : ",";
+        const size_t separator_len = strlen(separator);
+        const size_t permission_len = strlen(permissions->items[i]);
+
+        if (used + separator_len + permission_len >= dest_size) {
+            return false;
+        }
+
+        memcpy(dest + used, separator, separator_len);
+        used += separator_len;
+        memcpy(dest + used, permissions->items[i], permission_len);
+        used += permission_len;
+        dest[used] = '\0';
+    }
+
+    return true;
+}
+
+static void write_permission_items_xml(FILE *file, const char *requested_permissions)
+{
+    if (requested_permissions == NULL || requested_permissions[0] == '\0') {
+        fputs("    <perms />\n", file);
+        return;
+    }
+
+    fputs("    <perms>\n", file);
+
+    const char *cursor = requested_permissions;
+    while (*cursor != '\0') {
+        const char *end = strchr(cursor, ',');
+        const size_t len = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+
+        if (len > 0 && len < VODKA_PERMISSION_MAX) {
+            char permission[VODKA_PERMISSION_MAX];
+            memcpy(permission, cursor, len);
+            permission[len] = '\0';
+            if (validate_permission_name(permission)) {
+                fputs("      <item name=\"", file);
+                write_xml_escaped(file, permission);
+                fputs("\" granted=\"false\" flags=\"0\" />\n", file);
+            }
+        }
+
+        if (end == NULL) {
+            break;
+        }
+        cursor = end + 1;
+    }
+
+    fputs("    </perms>\n", file);
+}
+
+static bool regenerate_package_state(const char *prefix)
+{
+    char android_root[VODKA_PATH_MAX];
+    char packages_xml[VODKA_PATH_MAX];
+    char packages_list[VODKA_PATH_MAX];
+    char restrictions_xml[VODKA_PATH_MAX];
+    char packages[VODKA_MAX_APPS][VODKA_PACKAGE_MAX];
+
+    if (!prefix_android_root(android_root, sizeof(android_root), prefix) ||
+        !join_path(packages_xml, sizeof(packages_xml), android_root, "data/system/packages.xml") ||
+        !join_path(packages_list, sizeof(packages_list), android_root, "data/system/packages.list") ||
+        !join_path(restrictions_xml, sizeof(restrictions_xml), android_root, "data/system/users/0/package-restrictions.xml")) {
+        fprintf(stderr, "package state path is too long\n");
+        return false;
+    }
+
+    if (!ensure_parent_dir(packages_xml) ||
+        !ensure_parent_dir(packages_list) ||
+        !ensure_parent_dir(restrictions_xml)) {
+        return false;
+    }
+
+    const size_t count = collect_installed_packages(prefix, packages);
+
+    FILE *list = fopen(packages_list, "w");
+    if (list == NULL) {
+        fprintf(stderr, "failed to create %s: %s\n", packages_list, strerror(errno));
+        return false;
+    }
+
+    FILE *xml = fopen(packages_xml, "w");
+    if (xml == NULL) {
+        fprintf(stderr, "failed to create %s: %s\n", packages_xml, strerror(errno));
+        fclose(list);
+        return false;
+    }
+
+    FILE *restrictions = fopen(restrictions_xml, "w");
+    if (restrictions == NULL) {
+        fprintf(stderr, "failed to create %s: %s\n", restrictions_xml, strerror(errno));
+        fclose(list);
+        fclose(xml);
+        return false;
+    }
+
+    fputs("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<packages>\n", xml);
+    fprintf(
+        xml,
+        "  <last-platform-version internal=\"%d\" external=\"%d\" fingerprint=\"vodka\" />\n",
+        VODKA_DEFAULT_TARGET_SDK,
+        VODKA_DEFAULT_TARGET_SDK);
+    fputs("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<package-restrictions>\n", restrictions);
+
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        char metadata_path[VODKA_PATH_MAX];
+        struct vodka_properties metadata = {0};
+
+        if (!package_metadata_path(metadata_path, sizeof(metadata_path), prefix, packages[i]) ||
+            !load_property_file(&metadata, metadata_path, "metadata")) {
+            ok = false;
+            continue;
+        }
+
+        const char *apk = property_value(&metadata, "apk", "");
+        const char *data_dir = property_value(&metadata, "data_dir", "");
+        const char *requested_permissions = property_value(&metadata, "requested_permissions", "");
+        const int uid = property_int_value(&metadata, "uid", VODKA_APP_UID_BASE + (int)i);
+        const int target_sdk = property_int_value(&metadata, "target_sdk", VODKA_DEFAULT_TARGET_SDK);
+        char android_apk[VODKA_PATH_MAX];
+        char android_data[VODKA_PATH_MAX];
+        char code_path[VODKA_PATH_MAX];
+
+        if (!host_to_android_path(android_apk, sizeof(android_apk), android_root, apk) ||
+            !host_to_android_path(android_data, sizeof(android_data), android_root, data_dir)) {
+            ok = false;
+            continue;
+        }
+
+        copy_string(code_path, sizeof(code_path), android_apk);
+        char *slash = strrchr(code_path, '/');
+        if (slash != NULL && strcmp(slash, "/base.apk") == 0) {
+            *slash = '\0';
+        }
+
+        fprintf(
+            list,
+            "%s %d 0 %s default %d 0 0\n",
+            packages[i],
+            uid,
+            android_data,
+            target_sdk);
+
+        fputs("  <package name=\"", xml);
+        write_xml_escaped(xml, packages[i]);
+        fputs("\" codePath=\"", xml);
+        write_xml_escaped(xml, code_path);
+        fprintf(
+            xml,
+            "\" nativeLibraryPath=\"%s/lib\" publicFlags=\"0\" privateFlags=\"0\" ft=\"0\" it=\"0\" ut=\"0\" version=\"1\" userId=\"%d\" targetSdkVersion=\"%d\">\n",
+            code_path,
+            uid,
+            target_sdk);
+        write_permission_items_xml(xml, requested_permissions);
+        fputs("  </package>\n", xml);
+
+        fputs("  <pkg name=\"", restrictions);
+        write_xml_escaped(restrictions, packages[i]);
+        fputs("\" installed=\"true\" stopped=\"false\" hidden=\"false\" />\n", restrictions);
+    }
+
+    fputs("</packages>\n", xml);
+    fputs("</package-restrictions>\n", restrictions);
+
+    if (fclose(list) != 0 || fclose(xml) != 0 || fclose(restrictions) != 0) {
+        fprintf(stderr, "failed to close package state files\n");
+        ok = false;
+    }
+
+    return ok;
 }
 
 static int command_init(const struct vodka_cli *cli)
@@ -1576,7 +3037,12 @@ static int command_status(const struct vodka_cli *cli)
         configured_app_process != NULL && access(configured_app_process, X_OK) == 0 ? "yes" : "no");
     const char *binder = runtime_binder_device(&config, NULL);
     printf("binder_device=%s\n", binder);
+    printf("binder_kind=%s\n", binder_device_kind(binder));
     printf("binder_ready=%s\n", binder_device_ready(binder) ? "yes" : "no");
+    char binder_state[VODKA_PATH_MAX];
+    if (join_path(binder_state, sizeof(binder_state), root, "data/system/vodka-binder-services.conf")) {
+        printf("binder_services_state=%s\n", path_exists(binder_state) ? "yes" : "no");
+    }
 
     if (is_directory(root)) {
         struct vodka_properties properties = {0};
@@ -1594,6 +3060,354 @@ static int command_status(const struct vodka_cli *cli)
     printf("installed_apps=%zu\n", collect_installed_packages(cli->prefix, packages));
 
     return 0;
+}
+
+static int command_binder_status(const struct vodka_cli *cli, int argc, char **argv)
+{
+    const char *binder_override = NULL;
+    bool configure = false;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--binder") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--binder requires a device path\n");
+                return 2;
+            }
+            binder_override = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--configure") == 0) {
+            configure = true;
+            continue;
+        }
+
+        fprintf(stderr, "usage: %s [--prefix PATH] binder-status [--binder DEVICE] [--configure]\n", cli->program);
+        return 2;
+    }
+
+    if (configure && !setup_prefix(cli->prefix)) {
+        return 1;
+    }
+
+    struct vodka_properties config = {0};
+    if (!load_prefix_config(cli->prefix, &config)) {
+        return 1;
+    }
+
+    const char *binder = binder_override == NULL ?
+        runtime_binder_device(&config, NULL) :
+        binder_override;
+
+    if (configure) {
+        char config_path[VODKA_PATH_MAX];
+        struct vodka_properties services_config = {0};
+        if (!prefix_config_path(config_path, sizeof(config_path), cli->prefix)) {
+            fprintf(stderr, "path too long: %s/config/vodka.conf\n", cli->prefix);
+            return 1;
+        }
+        if (!load_services_config(cli->prefix, &services_config) ||
+            !put_property(&config, "runtime.binder.device", binder, "config/vodka.conf") ||
+            !save_property_file(config_path, "# Vodka prefix configuration", &config) ||
+            !write_binder_compat_state(cli->prefix, binder) ||
+            !write_service_bridge_state(cli->prefix, binder, &services_config)) {
+            return 1;
+        }
+    }
+
+    static const char *const candidates[] = {
+        "/dev/binder",
+        "/dev/binderfs/binder",
+        "/dev/vndbinder",
+        "/dev/hwbinder",
+    };
+
+    printf("prefix=%s\n", cli->prefix);
+    printf("binder_device=%s\n", binder);
+    printf("binder_kind=%s\n", binder_device_kind(binder));
+    printf("binder_ready=%s\n", binder_device_ready(binder) ? "yes" : "no");
+    printf("configured=%s\n", configure ? "yes" : "no");
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        printf(
+            "candidate=%s kind=%s ready=%s\n",
+            candidates[i],
+            binder_device_kind(candidates[i]),
+            binder_device_ready(candidates[i]) ? "yes" : "no");
+    }
+
+    return 0;
+}
+
+static int command_bridge_status(const struct vodka_cli *cli, int argc, char **argv)
+{
+    const char *configure_service = NULL;
+    const char *configure_exec = NULL;
+    bool write_state = false;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--service") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--service requires a service name\n");
+                return 2;
+            }
+            configure_service = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--exec") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--exec requires a path\n");
+                return 2;
+            }
+            configure_exec = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--write-state") == 0) {
+            write_state = true;
+            continue;
+        }
+
+        fprintf(stderr, "usage: %s [--prefix PATH] bridge-status [--service NAME --exec PATH] [--write-state]\n", cli->program);
+        return 2;
+    }
+
+    if ((configure_service == NULL) != (configure_exec == NULL)) {
+        fprintf(stderr, "--service and --exec must be used together\n");
+        return 2;
+    }
+
+    if (configure_service != NULL && find_service_bridge(configure_service) == NULL) {
+        fprintf(stderr, "unknown service bridge: %s\n", configure_service);
+        return 2;
+    }
+
+    if ((configure_service != NULL || write_state) && !setup_prefix(cli->prefix)) {
+        return 1;
+    }
+
+    struct vodka_properties services_config = {0};
+    if (!load_services_config(cli->prefix, &services_config)) {
+        return 1;
+    }
+
+    if (configure_service != NULL) {
+        char key[VODKA_KEY_MAX];
+        if (!service_exec_key(key, sizeof(key), configure_service) ||
+            !put_property(&services_config, key, configure_exec, "config/services.conf") ||
+            !save_services_config(cli->prefix, &services_config)) {
+            return 1;
+        }
+        write_state = true;
+    }
+
+    struct vodka_properties prefix_config = {0};
+    if (!load_prefix_config(cli->prefix, &prefix_config)) {
+        return 1;
+    }
+    const char *binder = runtime_binder_device(&prefix_config, NULL);
+
+    if (write_state && !write_service_bridge_state(cli->prefix, binder, &services_config)) {
+        return 1;
+    }
+
+    printf("prefix=%s\n", cli->prefix);
+    printf("binder_device=%s\n", binder);
+    printf("binder_ready=%s\n", binder_device_ready(binder) ? "yes" : "no");
+    printf("configured=%s\n", configure_service == NULL ? "no" : "yes");
+
+    for (size_t i = 0; i < sizeof(service_bridges) / sizeof(service_bridges[0]); i++) {
+        const char *exec_path = service_exec_path(&services_config, service_bridges[i].name);
+        printf(
+            "service=%s binder=%s required=%s exec=%s ready=%s\n",
+            service_bridges[i].name,
+            service_bridges[i].binder_name,
+            service_bridges[i].required ? "yes" : "no",
+            exec_path == NULL ? "" : exec_path,
+            exec_path != NULL && access(exec_path, X_OK) == 0 ? "yes" : "no");
+    }
+
+    return 0;
+}
+
+static bool set_service_bridge_env(
+    const char *prefix,
+    const char *binder,
+    const struct service_bridge *service)
+{
+    char android_root[VODKA_PATH_MAX];
+    char packages_xml[VODKA_PATH_MAX];
+    char packages_list[VODKA_PATH_MAX];
+    char service_state[VODKA_PATH_MAX];
+
+    if (!prefix_android_root(android_root, sizeof(android_root), prefix) ||
+        !join_path(packages_xml, sizeof(packages_xml), android_root, "data/system/packages.xml") ||
+        !join_path(packages_list, sizeof(packages_list), android_root, "data/system/packages.list") ||
+        !android_services_state_path(service_state, sizeof(service_state), prefix)) {
+        fprintf(stderr, "service bridge environment path is too long\n");
+        return false;
+    }
+
+    return
+        set_runtime_env("VODKA_PREFIX", prefix) &&
+        set_runtime_env("VODKA_ANDROID_ROOT", android_root) &&
+        set_runtime_env("VODKA_BINDER_DEVICE", binder) &&
+        set_runtime_env("VODKA_SERVICE", service->name) &&
+        set_runtime_env("VODKA_BINDER_SERVICE", service->binder_name) &&
+        set_runtime_env("VODKA_SERVICE_REQUIRED", service->required ? "yes" : "no") &&
+        set_runtime_env("VODKA_PACKAGES_XML", packages_xml) &&
+        set_runtime_env("VODKA_PACKAGES_LIST", packages_list) &&
+        set_runtime_env("VODKA_SERVICE_STATE", service_state) &&
+        set_runtime_env("ANDROID_ROOT", "/system") &&
+        set_runtime_env("ANDROID_DATA", "/data");
+}
+
+static int launch_service_bridge(
+    const char *prefix,
+    const char *binder,
+    const struct service_bridge *service,
+    const char *exec_path,
+    bool wait_for_exit)
+{
+    if (exec_path == NULL || exec_path[0] == '\0') {
+        fprintf(stderr, "service bridge is not configured: %s\n", service->name);
+        return service->required ? 1 : 0;
+    }
+    if (access(exec_path, X_OK) != 0) {
+        fprintf(stderr, "service bridge executable is not executable: %s: %s\n", exec_path, strerror(errno));
+        return 1;
+    }
+
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "failed to fork service bridge %s: %s\n", service->name, strerror(errno));
+        return 1;
+    }
+
+    if (pid == 0) {
+        if (!set_service_bridge_env(prefix, binder, service)) {
+            _exit(126);
+        }
+
+        execl(exec_path, exec_path, service->name, service->binder_name, binder, (char *)NULL);
+        fprintf(stderr, "failed to execute service bridge %s: %s\n", exec_path, strerror(errno));
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    printf("service=%s pid=%ld status=started\n", service->name, (long)pid);
+
+    if (!wait_for_exit) {
+        return 0;
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        fprintf(stderr, "failed to wait for service bridge %s: %s\n", service->name, strerror(errno));
+        return 1;
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        fprintf(stderr, "service bridge %s terminated by signal %d\n", service->name, WTERMSIG(status));
+        return 128 + WTERMSIG(status);
+    }
+
+    return 1;
+}
+
+static int command_start_services(const struct vodka_cli *cli, int argc, char **argv)
+{
+    bool dry_run = false;
+    bool optional = false;
+    bool wait_for_exit = false;
+    const char *only_service = NULL;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0) {
+            dry_run = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--optional") == 0) {
+            optional = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--wait") == 0) {
+            wait_for_exit = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--service") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--service requires a service name\n");
+                return 2;
+            }
+            only_service = argv[++i];
+            continue;
+        }
+
+        fprintf(stderr, "usage: %s [--prefix PATH] start-services [--dry-run] [--wait] [--optional] [--service NAME]\n", cli->program);
+        return 2;
+    }
+
+    if (only_service != NULL && find_service_bridge(only_service) == NULL) {
+        fprintf(stderr, "unknown service bridge: %s\n", only_service);
+        return 2;
+    }
+
+    struct vodka_properties prefix_config = {0};
+    struct vodka_properties services_config = {0};
+    if (!load_prefix_config(cli->prefix, &prefix_config) ||
+        !load_services_config(cli->prefix, &services_config)) {
+        return 1;
+    }
+
+    const char *binder = runtime_binder_device(&prefix_config, NULL);
+    if (!write_service_bridge_state(cli->prefix, binder, &services_config)) {
+        return 1;
+    }
+
+    printf("prefix=%s\n", cli->prefix);
+    printf("binder_device=%s\n", binder);
+    printf("binder_ready=%s\n", binder_device_ready(binder) ? "yes" : "no");
+    printf("mode=%s\n", dry_run ? "dry-run" : "launch");
+
+    int result = 0;
+    for (size_t i = 0; i < sizeof(service_bridges) / sizeof(service_bridges[0]); i++) {
+        const struct service_bridge *service = &service_bridges[i];
+        const char *exec_path = service_exec_path(&services_config, service->name);
+
+        if (only_service != NULL && strcmp(only_service, service->name) != 0) {
+            continue;
+        }
+        if (!optional && !service->required && only_service == NULL) {
+            continue;
+        }
+
+        printf(
+            "service=%s binder=%s required=%s exec=%s ready=%s\n",
+            service->name,
+            service->binder_name,
+            service->required ? "yes" : "no",
+            exec_path == NULL ? "" : exec_path,
+            exec_path != NULL && access(exec_path, X_OK) == 0 ? "yes" : "no");
+
+        if (dry_run) {
+            if (service->required && (exec_path == NULL || access(exec_path, X_OK) != 0)) {
+                result = 1;
+            }
+            continue;
+        }
+
+        const int status = launch_service_bridge(cli->prefix, binder, service, exec_path, wait_for_exit);
+        if (status != 0 && result == 0) {
+            result = status;
+        }
+    }
+
+    return result;
 }
 
 static int command_probe(const struct vodka_cli *cli, int argc, char **argv)
@@ -1890,6 +3704,13 @@ static int command_install_runtime(const struct vodka_cli *cli, int argc, char *
         return 1;
     }
 
+    struct vodka_properties services_config = {0};
+    if (!load_services_config(cli->prefix, &services_config) ||
+        !write_binder_compat_state(cli->prefix, binder) ||
+        !write_service_bridge_state(cli->prefix, binder, &services_config)) {
+        return 1;
+    }
+
     printf("runtime_installed=%s\n", ok ? "yes" : "partial");
     printf("prefix=%s\n", cli->prefix);
     printf("android_root=%s\n", android_root);
@@ -1907,8 +3728,7 @@ static int command_install(const struct vodka_cli *cli, int argc, char **argv)
 {
     const char *apk_path = NULL;
     const char *package = NULL;
-    const char *activity = "";
-    char derived_package[VODKA_PACKAGE_MAX];
+    const char *activity = NULL;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--package") == 0) {
@@ -1944,15 +3764,27 @@ static int command_install(const struct vodka_cli *cli, int argc, char **argv)
         return 1;
     }
 
+    struct manifest_details manifest = {0};
+    if (!extract_manifest_details(apk_path, &apk, &manifest)) {
+        return 1;
+    }
+
     if (package == NULL) {
-        if (extract_plain_manifest_package(apk_path, &apk, derived_package, sizeof(derived_package))) {
-            package = derived_package;
+        if (manifest.has_package) {
+            package = manifest.package;
         } else {
             fprintf(
                 stderr,
                 "could not derive package name from AndroidManifest.xml; pass --package NAME\n");
             return 2;
         }
+    }
+
+    if (activity == NULL && manifest.has_launch_activity) {
+        activity = manifest.launch_activity;
+    }
+    if (activity == NULL) {
+        activity = "";
     }
 
     if (!validate_package_name(package)) {
@@ -1983,11 +3815,25 @@ static int command_install(const struct vodka_cli *cli, int argc, char **argv)
         return 1;
     }
 
+    int uid = installed_package_uid(cli->prefix, package);
+    if (uid < VODKA_APP_UID_BASE) {
+        uid = next_available_app_uid(cli->prefix);
+    }
+
     if (!copy_file_replace(apk_path, base_apk)) {
         return 1;
     }
 
-    char metadata_content[(VODKA_PATH_MAX * 4) + VODKA_PACKAGE_MAX + 512];
+    char permissions_value[VODKA_VALUE_MAX];
+    if (!permissions_to_metadata_value(permissions_value, sizeof(permissions_value), &manifest.permissions)) {
+        fprintf(stderr, "requested permission metadata is too large for package: %s\n", package);
+        return 1;
+    }
+
+    const int target_sdk = manifest.has_target_sdk ? manifest.target_sdk : VODKA_DEFAULT_TARGET_SDK;
+    const int min_sdk = manifest.has_min_sdk ? manifest.min_sdk : 0;
+
+    char metadata_content[(VODKA_PATH_MAX * 4) + (VODKA_VALUE_MAX * 2) + VODKA_PACKAGE_MAX + VODKA_ACTIVITY_MAX + 640];
     const int written = snprintf(
         metadata_content,
         sizeof(metadata_content),
@@ -1998,7 +3844,13 @@ static int command_install(const struct vodka_cli *cli, int argc, char **argv)
         "source_apk=%s\n"
         "launch_activity=%s\n"
         "manifest=%s\n"
+        "manifest_format=%s\n"
         "manifest_method=%u\n"
+        "requested_permissions=%s\n"
+        "uid=%d\n"
+        "min_sdk=%d\n"
+        "target_sdk=%d\n"
+        "seinfo=default\n"
         "state=installed\n",
         package,
         base_apk,
@@ -2006,7 +3858,12 @@ static int command_install(const struct vodka_cli *cli, int argc, char **argv)
         apk_path,
         activity,
         apk.has_manifest ? "present" : "missing",
-        (unsigned int)apk.manifest_method);
+        manifest.format,
+        (unsigned int)apk.manifest_method,
+        permissions_value,
+        uid,
+        min_sdk,
+        target_sdk);
 
     if (written < 0 || (size_t)written >= sizeof(metadata_content)) {
         fprintf(stderr, "metadata is too large for package: %s\n", package);
@@ -2017,10 +3874,20 @@ static int command_install(const struct vodka_cli *cli, int argc, char **argv)
         return 1;
     }
 
+    if (!regenerate_package_state(cli->prefix)) {
+        return 1;
+    }
+
     printf("package=%s\n", package);
+    printf("uid=%d\n", uid);
     printf("apk=%s\n", base_apk);
     printf("data_dir=%s\n", data_dir);
     printf("metadata=%s\n", metadata_path);
+    printf("manifest_format=%s\n", manifest.format);
+    printf("launch_activity=%s\n", activity);
+    printf("requested_permissions=%zu\n", manifest.permissions.count);
+    printf("target_sdk=%d\n", target_sdk);
+    printf("package_state=updated\n");
     printf("status=installed\n");
     return 0;
 }
@@ -2445,6 +4312,9 @@ static void print_usage(const char *program)
         "commands:\n"
         "  init                 create or refresh the Vodka prefix\n"
         "  status               report prefix and Android root status\n"
+        "  binder-status        report or configure Binder compatibility\n"
+        "  bridge-status        report or configure service bridges\n"
+        "  start-services       launch configured service bridges\n"
         "  install-runtime      import Android ART/app_process runtime files\n"
         "  install [options] APK stage an APK into the prefix\n"
         "  list                 list installed packages\n"
@@ -2516,6 +4386,18 @@ int main(int argc, char **argv)
             return 2;
         }
         return command_status(&cli);
+    }
+
+    if (strcmp(command, "binder-status") == 0) {
+        return command_binder_status(&cli, argc - index, argv + index);
+    }
+
+    if (strcmp(command, "bridge-status") == 0) {
+        return command_bridge_status(&cli, argc - index, argv + index);
+    }
+
+    if (strcmp(command, "start-services") == 0) {
+        return command_start_services(&cli, argc - index, argv + index);
     }
 
     if (strcmp(command, "install") == 0) {

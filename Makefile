@@ -1,22 +1,30 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
+LDLIBS ?= -lz
 BUILD_DIR ?= build
 
 VODKA := $(BUILD_DIR)/vodka
+BRIDGE_SERVICES := activity package window display input power surfaceflinger sensorservice audio clipboard
+BRIDGES := $(addprefix $(BUILD_DIR)/vodka-,$(addsuffix -bridge,$(BRIDGE_SERVICES)))
+PACKAGE_BRIDGE := $(abspath $(BUILD_DIR)/vodka-package-bridge)
 
 .PHONY: all check clean
 
-all: $(VODKA)
+all: $(VODKA) $(BRIDGES)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(VODKA): src/vodka.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+$(BUILD_DIR)/vodka-%-bridge: src/vodka_bridge.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVODKA_EXPECTED_SERVICE='"$*"' $< -o $@
 
 check: all
 	./scripts/validate_android_root.sh
 	$(VODKA) --prefix /tmp/vodka-check-unused probe android_root
+	for service in $(BRIDGE_SERVICES); do test -x "$(BUILD_DIR)/vodka-$$service-bridge"; done
 	set -e; \
 	tmpdir=$$(mktemp -d /tmp/vodka-prefix.XXXXXX); \
 	$(VODKA) --prefix "$$tmpdir" init; \
@@ -27,10 +35,17 @@ check: all
 	mkdir -p "$$tmpdir/apk"; \
 	printf '%s\n' \
 		'<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.vodka">' \
+		'  <uses-permission android:name="android.permission.INTERNET" />' \
 		'  <application android:label="Vodka Test" />' \
 		'</manifest>' > "$$tmpdir/apk/AndroidManifest.xml"; \
 	( cd "$$tmpdir/apk" && zip -0 -q "$$tmpdir/example.apk" AndroidManifest.xml ); \
 	$(VODKA) --prefix "$$tmpdir/prefix" install "$$tmpdir/example.apk"; \
+	test -f "$$tmpdir/prefix/android_root/data/system/packages.xml"; \
+	test -f "$$tmpdir/prefix/android_root/data/system/packages.list"; \
+	grep -q 'com.example.vodka' "$$tmpdir/prefix/android_root/data/system/packages.xml"; \
+	grep -q 'android.permission.INTERNET' "$$tmpdir/prefix/android_root/data/system/packages.xml"; \
+	grep -q 'requested_permissions=android.permission.INTERNET' "$$tmpdir/prefix/apps/com.example.vodka/metadata.conf"; \
+	grep -q 'com.example.vodka' "$$tmpdir/prefix/android_root/data/system/packages.list"; \
 	$(VODKA) --prefix "$$tmpdir/prefix" list; \
 	$(VODKA) --prefix "$$tmpdir/prefix" run --dry-run com.example.vodka; \
 	printf '%s\n' \
@@ -45,6 +60,18 @@ check: all
 		> "$$tmpdir/backend.sh"; \
 	chmod +x "$$tmpdir/backend.sh"; \
 	$(VODKA) --prefix "$$tmpdir/prefix" run --backend exec --exec "$$tmpdir/backend.sh" com.example.vodka
+	set -e; \
+	tmpdir=$$(mktemp -d /tmp/vodka-binary-manifest.XXXXXX); \
+	python3 scripts/make_binary_manifest_apk.py "$$tmpdir/binary.apk"; \
+	$(VODKA) --prefix "$$tmpdir/prefix" install "$$tmpdir/binary.apk"; \
+	grep -q 'package=com.example.binary' "$$tmpdir/prefix/apps/com.example.binary/metadata.conf"; \
+	grep -q 'manifest_format=binary' "$$tmpdir/prefix/apps/com.example.binary/metadata.conf"; \
+	grep -q 'launch_activity=com.example.binary.MainActivity' "$$tmpdir/prefix/apps/com.example.binary/metadata.conf"; \
+	grep -q 'requested_permissions=android.permission.INTERNET' "$$tmpdir/prefix/apps/com.example.binary/metadata.conf"; \
+	grep -q 'min_sdk=23' "$$tmpdir/prefix/apps/com.example.binary/metadata.conf"; \
+	grep -q 'target_sdk=31' "$$tmpdir/prefix/apps/com.example.binary/metadata.conf"; \
+	grep -q 'targetSdkVersion="31"' "$$tmpdir/prefix/android_root/data/system/packages.xml"; \
+	$(VODKA) --prefix "$$tmpdir/prefix" run --dry-run com.example.binary
 	set -e; \
 	tmpdir=$$(mktemp -d /tmp/vodka-app-process.XXXXXX); \
 	mkdir -p "$$tmpdir/runtime/system/bin" "$$tmpdir/runtime/system/framework" "$$tmpdir/apk"; \
@@ -66,13 +93,23 @@ check: all
 	: > "$$tmpdir/runtime/system/framework/core-oj.jar"; \
 	: > "$$tmpdir/runtime/system/framework/framework.jar"; \
 	: > "$$tmpdir/binder"; \
+	$(VODKA) --prefix "$$tmpdir/prefix" binder-status --binder "$$tmpdir/binder" --configure; \
+	$(VODKA) --prefix "$$tmpdir/prefix" bridge-status --service package --exec "$(PACKAGE_BRIDGE)"; \
+	test -f "$$tmpdir/prefix/android_root/data/system/vodka-service-bridges.conf"; \
 	printf '%s\n' \
 		'<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.vodka">' \
 		'  <application android:label="Vodka Test" />' \
 		'</manifest>' > "$$tmpdir/apk/AndroidManifest.xml"; \
 	( cd "$$tmpdir/apk" && zip -0 -q "$$tmpdir/example.apk" AndroidManifest.xml ); \
 	$(VODKA) --prefix "$$tmpdir/prefix" install-runtime --from "$$tmpdir/runtime" --binder "$$tmpdir/binder"; \
+	test -f "$$tmpdir/prefix/android_root/data/system/vodka-binder-services.conf"; \
+	grep -q 'service.activity=required' "$$tmpdir/prefix/android_root/data/system/vodka-binder-services.conf"; \
 	$(VODKA) --prefix "$$tmpdir/prefix" install "$$tmpdir/example.apk"; \
+	$(VODKA) --prefix "$$tmpdir/prefix" start-services --dry-run --service package; \
+	$(VODKA) --prefix "$$tmpdir/prefix" start-services --wait --service package; \
+	test -f "$$tmpdir/prefix/android_root/data/system/vodka-service-package.state"; \
+	grep -q 'status=ready' "$$tmpdir/prefix/android_root/data/system/vodka-service-package.state"; \
+	grep -q 'package_count=1' "$$tmpdir/prefix/android_root/data/system/vodka-service-package.state"; \
 	$(VODKA) --prefix "$$tmpdir/prefix" run com.example.vodka
 
 clean:

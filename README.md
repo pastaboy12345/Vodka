@@ -25,6 +25,8 @@ Build the CLI:
 make
 ```
 
+The CLI links against zlib so it can read deflated APK manifest entries.
+
 Create or refresh the default prefix at `$HOME/.vodka`:
 
 ```sh
@@ -47,8 +49,9 @@ build/vodka list
 build/vodka run --dry-run com.example.app
 ```
 
-For APKs whose manifest package cannot be read without Android tooling, pass the
-package explicitly:
+Vodka can derive package names from plain-text and Android binary XML
+manifests. For malformed or unusual APKs whose package cannot be parsed yet,
+pass the package explicitly:
 
 ```sh
 build/vodka install --package com.example.app app.apk
@@ -64,6 +67,9 @@ Import Android runtime artifacts and use `app_process`:
 
 ```sh
 build/vodka install-runtime --from /path/to/android-root --binder /dev/binder
+build/vodka binder-status
+build/vodka bridge-status --service package --exec build/vodka-package-bridge
+build/vodka start-services --dry-run
 build/vodka install app.apk
 build/vodka run com.example.app
 ```
@@ -87,6 +93,13 @@ Vodka can now launch a configured external backend with the staged app context;
 it can also import Android `app_process`/framework artifacts and launch the
 `app_process` backend. Full app compatibility still depends on a working Android
 userspace, Binder device, and system services.
+APK installs generate initial PackageManager-style state in `/data/system`.
+For parsed manifests, Vodka records requested permissions, SDK levels, and
+launcher activity metadata, then emits permissions and target SDK data into
+`packages.xml`.
+`make` also builds host service bridge executables named
+`build/vodka-<service>-bridge`; the current bridges validate the launch
+contract and write per-service runtime state for Binder service work.
 
 Run the current verification target:
 
